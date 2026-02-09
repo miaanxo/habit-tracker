@@ -345,26 +345,47 @@ m3.metric("기분", f"{mood}/10")
 # =========================
 st.subheader("📈 최근 7일 달성률")
 
-# 최근 7일 날짜 생성
 today = datetime.now().date()
 last7 = [today - timedelta(days=i) for i in range(6, -1)]
+
 rows = []
 for d in last7:
     key = _iso(d)
     rec = st.session_state.records.get(key)
-    if rec:
-        h = rec.get("habits", {})
-        c = sum(1 for v in h.values() if v)
-        t = len(h) if h else 5
-        rate = round((c / t) * 100) if t else 0
-        mood_v = rec.get("mood", None)
+
+    if isinstance(rec, dict):
+        h = rec.get("habits") or {}
+        # habits가 dict가 아닐 수도 있으니 방어
+        if not isinstance(h, dict):
+            h = {}
+
+        c = sum(1 for v in h.values() if bool(v))
+        t = len(h) if len(h) > 0 else 5
+        rate = int(round((c / t) * 100)) if t else 0
+        mood_v = rec.get("mood", 0)
     else:
         rate = 0
-        mood_v = None
-    rows.append({"date": key, "achievement(%)": rate, "mood": mood_v if mood_v is not None else 0})
+        mood_v = 0
 
-df = pd.DataFrame(rows).set_index("date")
-st.bar_chart(df[["achievement(%)"]], height=260)
+    rows.append({"date": key, "achievement(%)": rate, "mood": int(mood_v) if mood_v is not None else 0})
+
+# rows 방어: 혹시라도 비면 기본값 7개 생성
+if not rows:
+    rows = [{"date": _iso(today - timedelta(days=i)), "achievement(%)": 0, "mood": 0} for i in range(6, -1)]
+
+df = pd.DataFrame(rows)
+
+# 컬럼 방어: date가 없으면 강제로 생성
+if "date" not in df.columns:
+    df["date"] = [r.get("date", "") for r in rows]
+
+df = df.set_index("date")
+
+# 차트 표시 (컬럼이 없을 때도 대비)
+if "achievement(%)" in df.columns:
+    st.bar_chart(df[["achievement(%)"]], height=260)
+else:
+    st.warning("차트 데이터를 만들지 못했어요. 기록을 다시 저장해보세요.")
 
 # =========================
 # 결과 표시: 날씨 + 강아지 + AI 리포트
