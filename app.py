@@ -1,94 +1,148 @@
 # app.py
-import os
-import re
-import json
-import random
-from datetime import datetime, timedelta, date
+# Streamlit: AI 습관 트래커 (포켓몬 에디션) + 포켓몬 도감(기록) 기능
+# 실행: streamlit run app.py
 
-import requests
+from __future__ import annotations
+
+import random
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional, List, Tuple
+
 import pandas as pd
+import requests
 import streamlit as st
 
+# -----------------------------
+# Page config
+# -----------------------------
+st.set_page_config(page_title="AI 습관 트래커 (포켓몬)", page_icon="🎮", layout="wide")
 
-# =========================
-# 기본 설정
-# =========================
-st.set_page_config(page_title="AI 습관 트래커", page_icon="📊", layout="wide")
-st.title("📊 AI 습관 트래커")
+st.title("🎮 AI 습관 트래커 (포켓몬)")
+st.caption("오늘의 습관을 체크하고, 날씨 + 포켓몬 + AI 코치 리포트를 받아보세요!")
 
-# -------------------------
-# Sidebar: API Keys
-# -------------------------
+# -----------------------------
+# Sidebar: API keys
+# -----------------------------
 with st.sidebar:
     st.header("🔑 API 설정")
-    openai_api_key = st.text_input("OpenAI API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
-    owm_api_key = st.text_input("OpenWeatherMap API Key", type="password", value=os.getenv("OPENWEATHER_API_KEY", ""))
-    st.caption("키는 브라우저 세션에만 사용됩니다. (session_state 저장)")
+    openai_api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
+    owm_api_key = st.text_input("OpenWeatherMap API Key", type="password", placeholder="OWM Key...")
+    st.divider()
+    st.caption("키는 로컬에만 사용되며 저장하지 않습니다.")
 
-# =========================
-# Session State 초기화
-# =========================
-if "records" not in st.session_state:
-    # records: { "YYYY-MM-DD": {habits: {...}, mood: int, city: str, coach_style: str, created_at: str } }
-    st.session_state.records = {}
+# -----------------------------
+# Session state init (Pokedex)
+# -----------------------------
+if "pokedex" not in st.session_state:
+    # list[dict] 형태로 누적 기록
+    st.session_state.pokedex = []  # type: ignore[attr-defined]
+if "pokedex_ids" not in st.session_state:
+    # 중복 등록 방지용 (도감번호 기준)
+    st.session_state.pokedex_ids = set()  # type: ignore[attr-defined]
 
-if "demo_initialized" not in st.session_state:
-    st.session_state.demo_initialized = False
+# -----------------------------
+# Constants / helpers
+# -----------------------------
+HABITS: List[Tuple[str, str]] = [
+    ("기상 미션", "🌅"),
+    ("물 마시기", "💧"),
+    ("공부/독서", "📚"),
+    ("운동하기", "🏃"),
+    ("수면", "😴"),
+]
 
+CITIES = [
+    "Seoul",
+    "Busan",
+    "Incheon",
+    "Daegu",
+    "Daejeon",
+    "Gwangju",
+    "Suwon",
+    "Ulsan",
+    "Jeju",
+    "Sejong",
+]
 
-def _iso(d: date) -> str:
-    return d.strftime("%Y-%m-%d")
+COACH_STYLES = {
+    "스파르타 코치": "sparta",
+    "따뜻한 멘토": "mentor",
+    "게임 마스터": "gamemaster",
+}
 
-
-def _today_iso() -> str:
-    return datetime.now().date().strftime("%Y-%m-%d")
-
-
-def init_demo_records():
-    """데모용 6일 샘플 데이터 생성 (오늘 제외), session_state에 저장."""
-    if st.session_state.demo_initialized:
-        return
-
-    today = datetime.now().date()
-    cities = ["Seoul", "Busan", "Incheon", "Daegu", "Daejeon", "Gwangju", "Suwon", "Ulsan", "Jeju", "Sejong"]
-    styles = ["스파르타 코치", "따뜻한 멘토", "게임 마스터"]
-
-    for i in range(6, 0, -1):
-        d = today - timedelta(days=i)
-        # 랜덤 습관 체크
-        habits = {
-            "기상 미션": random.choice([True, False]),
-            "물 마시기": random.choice([True, False]),
-            "공부/독서": random.choice([True, False]),
-            "운동하기": random.choice([True, False]),
-            "수면": random.choice([True, False]),
-        }
-        mood = random.randint(4, 9)
-        city = random.choice(cities)
-        coach_style = random.choice(styles)
-        st.session_state.records[_iso(d)] = {
-            "habits": habits,
-            "mood": mood,
-            "city": city,
-            "coach_style": coach_style,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        }
-
-    st.session_state.demo_initialized = True
-
-
-init_demo_records()
+STAT_KR = {
+    "hp": "HP",
+    "attack": "공격",
+    "defense": "방어",
+    "special-attack": "특수공격",
+    "special-defense": "특수방어",
+    "speed": "스피드",
+}
 
 
-# =========================
-# API 연동 함수들
-# =========================
-def get_weather(city: str, api_key: str):
+def safe_get(d: Dict[str, Any], *keys: str, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _pokemon_record_from_api(pokemon: Dict[str, Any]) -> Dict[str, Any]:
+    """도감 저장용 레코드(평탄화) 생성"""
+    stats = pokemon.get("stats", {}) or {}
+    return {
+        "captured_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "dex_no": int(pokemon.get("dex_no") or 0),
+        "name": pokemon.get("name") or "",
+        "types": ", ".join(pokemon.get("types") or []),
+        "artwork": pokemon.get("artwork") or "",
+        "hp": int(stats.get("hp", 0)),
+        "attack": int(stats.get("attack", 0)),
+        "defense": int(stats.get("defense", 0)),
+        "sp_atk": int(stats.get("special-attack", 0)),
+        "sp_def": int(stats.get("special-defense", 0)),
+        "speed": int(stats.get("speed", 0)),
+        "bst": int(stats.get("hp", 0))
+        + int(stats.get("attack", 0))
+        + int(stats.get("defense", 0))
+        + int(stats.get("special-attack", 0))
+        + int(stats.get("special-defense", 0))
+        + int(stats.get("speed", 0)),
+    }
+
+
+def add_to_pokedex(pokemon: Optional[Dict[str, Any]]) -> bool:
+    """도감에 추가. 신규면 True, 중복/실패면 False"""
+    if not pokemon:
+        return False
+    dex_no = pokemon.get("dex_no")
+    if not dex_no:
+        return False
+
+    ids = st.session_state.pokedex_ids  # type: ignore[attr-defined]
+    if dex_no in ids:
+        return False
+
+    rec = _pokemon_record_from_api(pokemon)
+    st.session_state.pokedex.append(rec)  # type: ignore[attr-defined]
+    ids.add(dex_no)
+    return True
+
+
+# -----------------------------
+# API functions
+# -----------------------------
+def get_weather(city: str, api_key: str) -> Optional[Dict[str, Any]]:
     """
-    OpenWeatherMap에서 날씨 가져오기 (한국어, 섭씨).
-    실패 시 None 반환. timeout=10
+    OpenWeatherMap Current Weather API
+    - language: Korean (lang=kr)
+    - units: metric (섭씨)
+    - timeout=10
+    실패 시 None 반환
     """
-    if not city or not api_key:
+    if not api_key:
         return None
     try:
         url = "https://api.openweathermap.org/data/2.5/weather"
@@ -96,15 +150,19 @@ def get_weather(city: str, api_key: str):
         r = requests.get(url, params=params, timeout=10)
         if r.status_code != 200:
             return None
-        data = r.json()
-        weather_desc = (data.get("weather") or [{}])[0].get("description")
-        temp = (data.get("main") or {}).get("temp")
-        feels_like = (data.get("main") or {}).get("feels_like")
-        humidity = (data.get("main") or {}).get("humidity")
-        wind = (data.get("wind") or {}).get("speed")
+        j = r.json()
+
+        weather_desc = safe_get(j, "weather", default=[{}])[0].get("description")
+        icon = safe_get(j, "weather", default=[{}])[0].get("icon")
+        temp = safe_get(j, "main", "temp")
+        feels_like = safe_get(j, "main", "feels_like")
+        humidity = safe_get(j, "main", "humidity")
+        wind = safe_get(j, "wind", "speed")
+
         return {
             "city": city,
-            "desc": weather_desc,
+            "description": weather_desc,
+            "icon": icon,
             "temp_c": temp,
             "feels_like_c": feels_like,
             "humidity": humidity,
@@ -114,363 +172,426 @@ def get_weather(city: str, api_key: str):
         return None
 
 
-def _breed_from_dog_ceo_url(image_url: str):
-    # 예: https://images.dog.ceo/breeds/hound-afghan/n02088094_1003.jpg
-    try:
-        m = re.search(r"/breeds/([^/]+)/", image_url)
-        if not m:
-            return None
-        raw = m.group(1)  # "hound-afghan" 같은 형태
-        # 보기 좋게 변환
-        parts = raw.split("-")
-        parts = [p.replace("_", " ").strip().title() for p in parts if p.strip()]
-        return " ".join(parts) if parts else None
-    except Exception:
-        return None
-
-
-def get_dog_image():
+def get_pokemon() -> Optional[Dict[str, Any]]:
     """
-    Dog CEO에서 랜덤 강아지 사진 URL과 품종 가져오기.
-    실패 시 None 반환. timeout=10
+    PokeAPI: 1세대(1~151) 랜덤 포켓몬
+    - 공식 아트워크 URL
+    - 이름, 도감 번호, 타입, 스탯(HP/공격/방어/특수공격/특수방어/스피드)
+    - timeout=10
+    실패 시 None 반환
     """
     try:
-        url = "https://dog.ceo/api/breeds/image/random"
+        pid = random.randint(1, 151)
+        url = f"https://pokeapi.co/api/v2/pokemon/{pid}"
         r = requests.get(url, timeout=10)
         if r.status_code != 200:
             return None
-        data = r.json()
-        if data.get("status") != "success":
-            return None
-        image_url = data.get("message")
-        breed = _breed_from_dog_ceo_url(image_url) or "Unknown"
-        return {"image_url": image_url, "breed": breed}
-    except Exception:
-        return None
+        j = r.json()
 
+        name = j.get("name")
+        dex_no = j.get("id")
+        types = [t["type"]["name"] for t in j.get("types", []) if "type" in t]
+        artwork = safe_get(j, "sprites", "other", "official-artwork", "front_default")
 
-def _openai_responses(api_key: str, model: str, instructions: str, user_input: str, max_output_tokens: int = 700):
-    """
-    OpenAI Responses API 호출 (requests 사용).
-    실패 시 None 반환. timeout=10
-    """
-    if not api_key:
-        return None
-    try:
-        url = "https://api.openai.com/v1/responses"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
+        stats_raw = {s["stat"]["name"]: s["base_stat"] for s in j.get("stats", [])}
+        stats = {
+            "hp": int(stats_raw.get("hp", 0)),
+            "attack": int(stats_raw.get("attack", 0)),
+            "defense": int(stats_raw.get("defense", 0)),
+            "special-attack": int(stats_raw.get("special-attack", 0)),
+            "special-defense": int(stats_raw.get("special-defense", 0)),
+            "speed": int(stats_raw.get("speed", 0)),
         }
-        payload = {
-            "model": model,
-            "instructions": instructions,
-            "input": user_input,
-            "max_output_tokens": max_output_tokens,
-        }
-        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        # SDK의 output_text가 없어도 최대한 텍스트를 뽑아오기
-        if isinstance(data, dict) and data.get("output_text"):
-            return data["output_text"]
-        # output 배열에서 message의 content 텍스트 합치기
-        out = []
-        for item in data.get("output", []) if isinstance(data, dict) else []:
-            if item.get("type") == "message":
-                content = item.get("content", [])
-                for c in content:
-                    if c.get("type") in ("output_text", "text"):
-                        txt = c.get("text") or c.get("content") or ""
-                        if txt:
-                            out.append(txt)
-        return "\n".join(out).strip() if out else None
+
+        return {"name": name, "dex_no": dex_no, "types": types, "artwork": artwork, "stats": stats}
     except Exception:
         return None
 
 
 def generate_report(
-    habits: dict,
+    openai_api_key: str,
+    coach_style_key: str,
+    habits_checked: Dict[str, bool],
     mood: int,
-    weather: dict | None,
-    dog: dict | None,
-    coach_style: str,
-    openai_key: str,
-):
+    weather: Optional[Dict[str, Any]],
+    pokemon: Optional[Dict[str, Any]],
+    pokedex_count: int,
+) -> str:
     """
-    습관+기분+날씨+강아지 품종을 모아서 OpenAI에 전달해 리포트 생성.
-    코치 스타일별 시스템 프롬프트 적용.
+    OpenAI 호출: gpt-5-mini
     출력 형식:
-      - 컨디션 등급(S~D)
-      - 습관 분석
-      - 날씨 코멘트
-      - 내일 미션
-      - 오늘의 한마디
-    모델: gpt-5-mini
+    - 컨디션 등급(S~D)
+    - 습관 분석
+    - 날씨 코멘트
+    - 내일 미션
+    - 오늘의 파트너 포켓몬(포켓몬 이름/타입/스탯을 활용한 응원)
     """
-    style_prompts = {
-        "스파르타 코치": (
-            "너는 엄격하고 단호한 코치다. 변명은 차단하고, 실행 가능한 지시를 짧고 강하게 준다. "
-            "하지만 인신공격은 절대 하지 않는다."
-        ),
-        "따뜻한 멘토": (
-            "너는 따뜻하고 공감적인 멘토다. 사용자의 노력을 인정하고, 작은 개선을 부드럽게 제안한다. "
-            "과장된 칭찬 대신 구체적이고 현실적인 격려를 한다."
-        ),
-        "게임 마스터": (
-            "너는 RPG 게임 마스터다. 사용자의 하루를 퀘스트/경험치/레벨업 관점으로 재해석해준다. "
-            "유쾌하지만 목표는 분명하게, 내일 미션은 '퀘스트'로 제시한다."
-        ),
-    }
+    if not openai_api_key:
+        return "⚠️ OpenAI API Key가 없어 리포트를 생성할 수 없어요. (사이드바에 입력해 주세요)"
 
-    checked = [k for k, v in habits.items() if v]
-    unchecked = [k for k, v in habits.items() if not v]
+    style_system = {
+        "sparta": (
+            "너는 엄격한 스파르타 코치다. 말투는 단호하고 직설적이며, 핑계를 허용하지 않는다. "
+            "하지만 모욕적이진 않다. 짧고 강하게, 실행 지시를 준다."
+        ),
+        "mentor": (
+            "너는 따뜻한 멘토다. 말투는 다정하고 공감적이며, 작은 성취도 칭찬한다. "
+            "현실적인 조언과 격려를 함께 준다."
+        ),
+        "gamemaster": (
+            "너는 RPG 게임 마스터다. 오늘을 퀘스트와 스테이지로 묘사하며, 분위기는 모험적이고 재밌다. "
+            "사용자가 성장하도록 다음 미션을 제시한다."
+        ),
+    }.get(coach_style_key, "너는 도움이 되는 코치다.")
 
-    weather_text = "날씨 정보 없음"
+    checked_list = [k for k, v in habits_checked.items() if v]
+    unchecked_list = [k for k, v in habits_checked.items() if not v]
+
+    weather_block = "날씨 정보: 없음(가져오기 실패 또는 API Key 없음)"
     if weather:
-        weather_text = (
-            f"{weather.get('city')} / {weather.get('desc')} / "
-            f"{weather.get('temp_c')}°C(체감 {weather.get('feels_like_c')}°C), "
-            f"습도 {weather.get('humidity')}%, 바람 {weather.get('wind_mps')}m/s"
+        weather_block = (
+            f"날씨 정보: 도시={weather.get('city')}, 상태={weather.get('description')}, "
+            f"기온={weather.get('temp_c')}°C, 체감={weather.get('feels_like_c')}°C, "
+            f"습도={weather.get('humidity')}%, 바람={weather.get('wind_mps')}m/s"
         )
 
-    dog_text = "강아지 정보 없음"
-    if dog:
-        dog_text = f"{dog.get('breed')} (이미지 URL: {dog.get('image_url')})"
+    pokemon_block = "포켓몬 정보: 없음(가져오기 실패)"
+    if pokemon:
+        stats = pokemon.get("stats", {})
+        pokemon_block = (
+            f"포켓몬 정보: 이름={pokemon.get('name')}, 도감번호={pokemon.get('dex_no')}, "
+            f"타입={', '.join(pokemon.get('types', []))}, "
+            f"스탯(HP={stats.get('hp')}, 공격={stats.get('attack')}, 방어={stats.get('defense')}, "
+            f"특수공격={stats.get('special-attack')}, 특수방어={stats.get('special-defense')}, 스피드={stats.get('speed')})"
+        )
 
-    instructions = (
-        style_prompts.get(coach_style, style_prompts["따뜻한 멘토"])
-        + "\n\n"
-        + "출력은 반드시 아래 섹션 헤더를 그대로 사용해 한국어로 작성해.\n"
-        + "형식:\n"
-        + "컨디션 등급: (S/A/B/C/D 중 하나)\n"
-        + "습관 분석:\n"
-        + "- ...\n"
-        + "날씨 코멘트:\n"
-        + "- ...\n"
-        + "내일 미션:\n"
-        + "- ... (최대 3개)\n"
-        + "오늘의 한마디:\n"
-        + "- ... (1줄)\n"
-        + "추가 설명이나 다른 섹션은 만들지 마.\n"
-    )
+    user_payload = f"""
+[오늘 습관 체크]
+- 완료: {", ".join(checked_list) if checked_list else "없음"}
+- 미완료: {", ".join(unchecked_list) if unchecked_list else "없음"}
+- 기분(1~10): {mood}
+- 내 도감 진행도: {pokedex_count}/151
 
-    user_input = (
-        "아래 데이터를 바탕으로 오늘의 컨디션 리포트를 작성해줘.\n\n"
-        f"[기분] {mood}/10\n"
-        f"[완료한 습관] {', '.join(checked) if checked else '없음'}\n"
-        f"[미완료 습관] {', '.join(unchecked) if unchecked else '없음'}\n"
-        f"[날씨] {weather_text}\n"
-        f"[강아지] {dog_text}\n"
-    )
+[{weather_block}]
 
-    return _openai_responses(
-        api_key=openai_key,
-        model="gpt-5-mini",
-        instructions=instructions,
-        user_input=user_input,
-        max_output_tokens=750,
-    )
+[{pokemon_block}]
+
+[출력 형식(반드시 지켜라)]
+1) 컨디션 등급: S/A/B/C/D 중 하나 (한 줄)
+2) 습관 분석: 3~6줄 (잘한 점 + 개선 1~2개)
+3) 날씨 코멘트: 1~3줄 (날씨에 맞춘 행동 팁)
+4) 내일 미션: 3개 체크리스트(짧게)
+5) 오늘의 파트너 포켓몬: 포켓몬 이름/타입/스탯을 활용한 응원 3~5줄
+""".strip()
+
+    try:
+        try:
+            from openai import OpenAI  # type: ignore
+
+            client = OpenAI(api_key=openai_api_key)
+            resp = client.chat.completions.create(
+                model="gpt-5-mini",
+                messages=[
+                    {"role": "system", "content": style_system},
+                    {"role": "user", "content": user_payload},
+                ],
+            )
+            return (resp.choices[0].message.content or "").strip() or "리포트 생성에 실패했어요."
+        except Exception:
+            import openai  # type: ignore
+
+            openai.api_key = openai_api_key
+            resp = openai.ChatCompletion.create(
+                model="gpt-5-mini",
+                messages=[
+                    {"role": "system", "content": style_system},
+                    {"role": "user", "content": user_payload},
+                ],
+            )
+            return (resp["choices"][0]["message"]["content"] or "").strip() or "리포트 생성에 실패했어요."
+    except Exception as e:
+        return f"⚠️ 리포트 생성 중 오류가 발생했어요: {e}"
 
 
-# =========================
-# 습관 체크인 UI
-# =========================
-HABITS = [
-    ("🌅", "기상 미션"),
-    ("💧", "물 마시기"),
-    ("📚", "공부/독서"),
-    ("🏃", "운동하기"),
-    ("😴", "수면"),
-]
-
-CITIES = ["Seoul", "Busan", "Incheon", "Daegu", "Daejeon", "Gwangju", "Suwon", "Ulsan", "Jeju", "Sejong"]
-COACH_STYLES = ["스파르타 코치", "따뜻한 멘토", "게임 마스터"]
-
-today_key = _today_iso()
-today_record = st.session_state.records.get(today_key, None)
-
-# 기본값 복원 (있으면 오늘 기록, 없으면 초기값)
-default_habits = {name: False for _, name in HABITS}
-default_mood = 6
-default_city = "Seoul"
-default_style = "따뜻한 멘토"
-
-if today_record:
-    default_habits.update(today_record.get("habits", {}))
-    default_mood = int(today_record.get("mood", default_mood))
-    default_city = today_record.get("city", default_city)
-    default_style = today_record.get("coach_style", default_style)
-
+# -----------------------------
+# Habit check-in UI
+# -----------------------------
 st.subheader("✅ 오늘의 체크인")
 
-left, right = st.columns([1, 1])
+colA, colB = st.columns([1.2, 1])
 
-# 체크박스 5개를 2열로 배치
-cb_cols = st.columns(2)
-habits_state = {}
-for i, (emoji, name) in enumerate(HABITS):
-    col = cb_cols[i % 2]
-    with col:
-        habits_state[name] = st.checkbox(f"{emoji} {name}", value=bool(default_habits.get(name, False)))
-
-mood = st.slider("🙂 오늘 기분은 어때요?", min_value=1, max_value=10, value=int(default_mood))
-city = st.selectbox("🏙️ 도시 선택", options=CITIES, index=CITIES.index(default_city) if default_city in CITIES else 0)
-coach_style = st.radio("🧑‍🏫 코치 스타일", options=COACH_STYLES, index=COACH_STYLES.index(default_style), horizontal=True)
-
-# session_state 기록 저장 (즉시)
-st.session_state.records[today_key] = {
-    "habits": habits_state,
-    "mood": mood,
-    "city": city,
-    "coach_style": coach_style,
-    "created_at": datetime.now().isoformat(timespec="seconds"),
-}
-
-# =========================
-# 달성률 + metric 카드
-# =========================
-completed_count = sum(1 for v in habits_state.values() if v)
-total_count = len(habits_state)
-achievement = int(round((completed_count / total_count) * 100)) if total_count else 0
-
-m1, m2, m3 = st.columns(3)
-m1.metric("달성률", f"{achievement}%")
-m2.metric("달성 습관", f"{completed_count}/{total_count}")
-m3.metric("기분", f"{mood}/10")
-
-# =========================
-# 7일 바 차트 (데모 6일 + 오늘)
-# =========================
-st.subheader("📈 최근 7일 달성률")
-
-today = datetime.now().date()
-last7 = [today - timedelta(days=i) for i in range(6, -1)]
-
-rows = []
-for d in last7:
-    key = _iso(d)
-    rec = st.session_state.records.get(key)
-
-    if isinstance(rec, dict):
-        h = rec.get("habits") or {}
-        # habits가 dict가 아닐 수도 있으니 방어
-        if not isinstance(h, dict):
-            h = {}
-
-        c = sum(1 for v in h.values() if bool(v))
-        t = len(h) if len(h) > 0 else 5
-        rate = int(round((c / t) * 100)) if t else 0
-        mood_v = rec.get("mood", 0)
-    else:
-        rate = 0
-        mood_v = 0
-
-    rows.append({"date": key, "achievement(%)": rate, "mood": int(mood_v) if mood_v is not None else 0})
-
-# rows 방어: 혹시라도 비면 기본값 7개 생성
-if not rows:
-    rows = [{"date": _iso(today - timedelta(days=i)), "achievement(%)": 0, "mood": 0} for i in range(6, -1)]
-
-df = pd.DataFrame(rows)
-
-# 컬럼 방어: date가 없으면 강제로 생성
-if "date" not in df.columns:
-    df["date"] = [r.get("date", "") for r in rows]
-
-df = df.set_index("date")
-
-# 차트 표시 (컬럼이 없을 때도 대비)
-if "achievement(%)" in df.columns:
-    st.bar_chart(df[["achievement(%)"]], height=260)
-else:
-    st.warning("차트 데이터를 만들지 못했어요. 기록을 다시 저장해보세요.")
-
-# =========================
-# 결과 표시: 날씨 + 강아지 + AI 리포트
-# =========================
-st.subheader("🧠 AI 코치 리포트")
-
-btn_disabled = not bool(openai_api_key)
-btn_help = "OpenAI API Key를 사이드바에 입력하면 활성화됩니다." if btn_disabled else None
-
-if st.button("컨디션 리포트 생성", type="primary", disabled=btn_disabled, help=btn_help):
-    with st.spinner("날씨/강아지/AI 리포트를 준비하는 중..."):
-        weather = get_weather(city, owm_api_key)
-        dog = get_dog_image()
-
-        report = generate_report(
-            habits=habits_state,
-            mood=mood,
-            weather=weather,
-            dog=dog,
-            coach_style=coach_style,
-            openai_key=openai_api_key,
-        )
-
-    # 2열 카드: 날씨 + 강아지
+with colA:
+    st.markdown("#### 습관 체크")
     c1, c2 = st.columns(2)
+    habits_checked: Dict[str, bool] = {}
+
+    left_idx = [0, 2, 4]
+    right_idx = [1, 3]
 
     with c1:
-        st.markdown("#### 🌦️ 오늘의 날씨")
-        if weather:
-            st.info(
-                f"**{weather.get('city')}**\n\n"
-                f"- 상태: {weather.get('desc')}\n"
-                f"- 기온: {weather.get('temp_c')}°C (체감 {weather.get('feels_like_c')}°C)\n"
-                f"- 습도: {weather.get('humidity')}%\n"
-                f"- 바람: {weather.get('wind_mps')}m/s"
+        for i in left_idx:
+            label, emo = HABITS[i]
+            habits_checked[label] = st.checkbox(f"{emo} {label}", key=f"habit_{i}")
+    with c2:
+        for i in right_idx:
+            label, emo = HABITS[i]
+            habits_checked[label] = st.checkbox(f"{emo} {label}", key=f"habit_{i}")
+
+    st.markdown("#### 😊 기분")
+    mood = st.slider("오늘 기분은 어때요?", min_value=1, max_value=10, value=6, step=1)
+
+with colB:
+    st.markdown("#### 🌍 환경 설정")
+    city = st.selectbox("도시 선택", CITIES, index=0)
+    coach_style_label = st.radio("코치 스타일", list(COACH_STYLES.keys()), horizontal=False)
+    coach_style_key = COACH_STYLES[coach_style_label]
+
+# -----------------------------
+# Metrics + chart data
+# -----------------------------
+completed = sum(1 for v in habits_checked.values() if v)
+total = len(HABITS)
+achievement_rate = int(round((completed / total) * 100)) if total else 0
+
+m1, m2, m3 = st.columns(3)
+m1.metric("달성률", f"{achievement_rate} %")
+m2.metric("달성 습관", f"{completed} / {total}")
+m3.metric("기분", f"{mood} / 10")
+
+st.divider()
+
+st.subheader("📊 최근 7일 기록 (데모 + 오늘)")
+
+today = datetime.now().date()
+sample_days = [today - timedelta(days=d) for d in range(6, 0, -1)]
+rng = random.Random(42)
+
+sample_rows = []
+for d in sample_days:
+    sample_rows.append({"date": d.isoformat(), "completed": rng.randint(1, 5), "mood": rng.randint(3, 9)})
+
+today_row = {"date": today.isoformat(), "completed": completed, "mood": mood}
+
+df7 = pd.DataFrame(sample_rows + [today_row])
+df7["day"] = pd.to_datetime(df7["date"]).dt.strftime("%m/%d")
+df7["achievement_rate"] = (df7["completed"] / total * 100).round(0).astype(int)
+
+chart_df = df7[["day", "achievement_rate"]].set_index("day")
+st.bar_chart(chart_df, height=220)
+
+# -----------------------------
+# Pokedex (record so far) UI
+# -----------------------------
+st.divider()
+st.subheader("📕 내 포켓몬 도감")
+
+pokedex_count = len(st.session_state.pokedex)  # type: ignore[attr-defined]
+progress = pokedex_count / 151
+pcol1, pcol2, pcol3 = st.columns([1, 1, 2])
+
+pcol1.metric("도감 등록", f"{pokedex_count} / 151")
+pcol2.metric("진행도", f"{int(round(progress * 100))}%")
+
+with pcol3:
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        if st.button("🧹 도감 초기화", use_container_width=True):
+            st.session_state.pokedex = []  # type: ignore[attr-defined]
+            st.session_state.pokedex_ids = set()  # type: ignore[attr-defined]
+            st.success("도감을 초기화했어요.")
+    with b2:
+        # CSV 다운로드
+        if pokedex_count > 0:
+            df_poke = pd.DataFrame(st.session_state.pokedex)  # type: ignore[attr-defined]
+            csv = df_poke.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "⬇️ CSV 다운로드",
+                data=csv,
+                file_name="pokedex.csv",
+                mime="text/csv",
+                use_container_width=True,
             )
         else:
-            st.warning("날씨 정보를 가져오지 못했어요. (API Key/도시/네트워크 확인)")
+            st.button("⬇️ CSV 다운로드", disabled=True, use_container_width=True)
+    with b3:
+        # 중복 제외하고 랜덤 1마리 미리보기용 필터(옵션)
+        show_latest = st.toggle("최근 등록만 보기", value=True)
 
-    with c2:
-        st.markdown("#### 🐶 오늘의 강아지")
-        if dog and dog.get("image_url"):
-            st.caption(f"품종: **{dog.get('breed', 'Unknown')}**")
-            st.image(dog["image_url"], use_container_width=True)
+if pokedex_count == 0:
+    st.info("아직 도감에 등록된 포켓몬이 없어요. 아래에서 리포트를 생성하면 자동으로 등록돼요!")
+else:
+    df_poke = pd.DataFrame(st.session_state.pokedex)  # type: ignore[attr-defined]
+    df_poke = df_poke.sort_values(["dex_no"], ascending=True)
+
+    if show_latest:
+        # 최근 12마리만 카드처럼
+        recent = df_poke.sort_values(["captured_at"], ascending=False).head(12)
+        st.caption("최근 등록 포켓몬(최대 12마리)")
+        grid = st.columns(6)
+        for idx, row in enumerate(recent.to_dict("records")):
+            with grid[idx % 6]:
+                if row.get("artwork"):
+                    st.image(row["artwork"], use_container_width=True)
+                st.markdown(f"**#{int(row['dex_no']):03d} {row['name']}**")
+                st.caption(f"타입: {row.get('types','-')}")
+                st.caption(f"BST: {row.get('bst', 0)}")
+    st.markdown("#### 도감 목록")
+    st.dataframe(
+        df_poke[
+            [
+                "dex_no",
+                "name",
+                "types",
+                "bst",
+                "hp",
+                "attack",
+                "defense",
+                "sp_atk",
+                "sp_def",
+                "speed",
+                "captured_at",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# -----------------------------
+# Generate report section
+# -----------------------------
+st.divider()
+st.subheader("🧠 AI 코치 컨디션 리포트")
+
+btn_col1, btn_col2 = st.columns([1, 2])
+with btn_col1:
+    generate = st.button("🚀 컨디션 리포트 생성", use_container_width=True)
+
+weather_data = None
+pokemon_data = None
+ai_report = None
+
+if generate:
+    with st.spinner("날씨/포켓몬/리포트 생성 중..."):
+        weather_data = get_weather(city, owm_api_key)
+        pokemon_data = get_pokemon()
+
+        # ✅ 도감 자동 기록 (중복은 무시)
+        added = add_to_pokedex(pokemon_data)
+        if pokemon_data and added:
+            st.toast(f"도감에 등록!  #{int(pokemon_data.get('dex_no')):03d} {pokemon_data.get('name')}", icon="📕")
+        elif pokemon_data and not added:
+            st.toast("이미 도감에 있는 포켓몬이에요 (중복 등록 방지).", icon="✅")
+
+        pokedex_count_now = len(st.session_state.pokedex)  # type: ignore[attr-defined]
+        ai_report = generate_report(
+            openai_api_key=openai_api_key,
+            coach_style_key=coach_style_key,
+            habits_checked=habits_checked,
+            mood=mood,
+            weather=weather_data,
+            pokemon=pokemon_data,
+            pokedex_count=pokedex_count_now,
+        )
+
+    # Results layout: Weather + Pokemon cards
+    wcol, pcol = st.columns(2)
+
+    with wcol:
+        st.markdown("### 🌦️ 오늘의 날씨")
+        if weather_data:
+            desc = weather_data.get("description", "-")
+            temp = weather_data.get("temp_c", "-")
+            feels = weather_data.get("feels_like_c", "-")
+            humidity = weather_data.get("humidity", "-")
+            wind = weather_data.get("wind_mps", "-")
+            st.info(
+                f"**{weather_data.get('city')}**\n\n"
+                f"- 상태: **{desc}**\n"
+                f"- 기온: **{temp}°C** (체감 {feels}°C)\n"
+                f"- 습도: **{humidity}%**\n"
+                f"- 바람: **{wind} m/s**"
+            )
         else:
-            st.warning("강아지 이미지를 가져오지 못했어요. (네트워크 확인)")
+            st.warning("날씨 정보를 가져오지 못했어요. (OpenWeatherMap API Key 확인)")
 
-    # AI 리포트
-    st.markdown("#### 📝 리포트")
-    if report:
-        st.markdown(report)
-    else:
-        st.error("AI 리포트를 생성하지 못했어요. (OpenAI Key/요금/모델/네트워크 확인)")
+    with pcol:
+        st.markdown("### 🧩 오늘의 파트너 포켓몬")
+        if pokemon_data:
+            name = pokemon_data.get("name", "?")
+            dex_no = pokemon_data.get("dex_no", "?")
+            types = pokemon_data.get("types", [])
+            artwork = pokemon_data.get("artwork")
 
-    # 공유용 텍스트
-    share_lines = []
-    share_lines.append(f"📊 AI 습관 트래커 - {today_key}")
-    share_lines.append(f"도시: {city} | 코치: {coach_style}")
-    share_lines.append(f"달성률: {achievement}% ({completed_count}/{total_count}) | 기분: {mood}/10")
-    share_lines.append("완료 습관: " + (", ".join([k for k, v in habits_state.items() if v]) or "없음"))
-    if weather:
-        share_lines.append(f"날씨: {weather.get('desc')} / {weather.get('temp_c')}°C")
-    if dog:
-        share_lines.append(f"강아지: {dog.get('breed')}")
-    share_lines.append("\n[AI 리포트]\n" + (report or "(생성 실패)"))
+            head = f"**#{int(dex_no):03d} {name}**  ·  타입: **{', '.join(types) if types else '-'}**"
+            st.success(head)
 
-    st.markdown("#### 📣 공유용 텍스트")
-    st.code("\n".join(share_lines), language="markdown")
+            img_col, stat_col = st.columns([1, 1.1])
+            with img_col:
+                if artwork:
+                    st.image(artwork, caption=f"{name} (Official Artwork)", use_container_width=True)
+                else:
+                    st.caption("공식 아트워크를 찾지 못했어요.")
 
-# =========================
-# 하단: API 안내
-# =========================
-with st.expander("ℹ️ API 안내 / 설정 팁"):
+            with stat_col:
+                stats = pokemon_data.get("stats", {})
+                stat_series = pd.Series(
+                    {
+                        STAT_KR["hp"]: stats.get("hp", 0),
+                        STAT_KR["attack"]: stats.get("attack", 0),
+                        STAT_KR["defense"]: stats.get("defense", 0),
+                        STAT_KR["special-attack"]: stats.get("special-attack", 0),
+                        STAT_KR["special-defense"]: stats.get("special-defense", 0),
+                        STAT_KR["speed"]: stats.get("speed", 0),
+                    }
+                )
+
+                # st.bar_chart 빨간색 (가능하면 적용, 아니면 기본)
+                try:
+                    st.bar_chart(stat_series, height=240, color="#ff4b4b")
+                except Exception:
+                    st.bar_chart(stat_series, height=240)
+
+        else:
+            st.warning("포켓몬을 불러오지 못했어요. (PokeAPI 상태/네트워크 확인)")
+
+    st.markdown("### 📝 AI 리포트")
+    st.write(ai_report if ai_report else "리포트가 비어 있어요.")
+
+    # Share text
+    st.markdown("### 📣 공유용 텍스트")
+    partner_line = "파트너 포켓몬: (불러오기 실패)"
+    if pokemon_data:
+        partner_line = f"파트너 포켓몬: #{int(pokemon_data.get('dex_no')):03d} {pokemon_data.get('name')} ({', '.join(pokemon_data.get('types', []))})"
+
+    weather_line = "날씨: (불러오기 실패)"
+    if weather_data:
+        weather_line = f"날씨: {weather_data.get('city')} · {weather_data.get('description')} · {weather_data.get('temp_c')}°C"
+
+    pokedex_count_now = len(st.session_state.pokedex)  # type: ignore[attr-defined]
+    share_text = f"""[{today.isoformat()}] AI 습관 트래커(포켓몬)
+- 달성률: {achievement_rate}%
+- 완료: {completed}/{total}
+- 기분: {mood}/10
+- 도감: {pokedex_count_now}/151
+- {weather_line}
+- {partner_line}
+"""
+    st.code(share_text, language="text")
+
+# -----------------------------
+# Footer: API 안내
+# -----------------------------
+with st.expander("ℹ️ API 안내 / 문제 해결"):
     st.markdown(
         """
-- **OpenAI API Key**: OpenAI 플랫폼에서 발급한 키를 입력하세요.
-  - 이 앱은 **Responses API**를 사용해 `https://api.openai.com/v1/responses` 로 요청합니다.
-  - 모델은 요청대로 **gpt-5-mini**를 사용합니다.
-- **OpenWeatherMap API Key**: OpenWeatherMap에서 발급받아 입력하세요.
-  - 현재 날씨 API(`data/2.5/weather`)를 사용하며 **섭씨(units=metric)**, **한국어(lang=kr)** 로 요청합니다.
-- **Dog CEO API**: 키 없이 무료로 호출됩니다.
-  - 랜덤 이미지 URL에서 품종(가능한 경우)을 추정해 표시합니다.
+- **OpenAI API Key**: AI 코치 리포트 생성에 필요합니다.
+- **OpenWeatherMap API Key**: 날씨 카드 표시(한국어/섭씨)에 필요합니다.
+- **PokeAPI**: 포켓몬 정보는 별도 키 없이 호출됩니다.
+- **도감 기록**: 브라우저 세션(세션 상태)에 저장됩니다. 새로고침/세션 종료 시 초기화될 수 있어요. (CSV 다운로드로 백업 추천)
 
-문제 해결:
-- 리포트 생성 실패: OpenAI Key, 결제/쿼터, 모델 접근 권한을 확인하세요.
-- 날씨 실패: OpenWeatherMap Key, 도시명(영문), 무료 플랜 제한 여부를 확인하세요.
+**자주 생기는 이슈**
+- 날씨가 안 나와요 → OpenWeatherMap 키가 맞는지, 도시명이 정확한지 확인하세요.
+- 포켓몬이 안 나와요 → 네트워크/일시적 장애일 수 있어요. 다시 시도해 보세요.
+- 리포트가 안 나와요 → OpenAI 키를 확인하고, 모델 접근 권한/요금 설정을 점검하세요.
 """
     )
